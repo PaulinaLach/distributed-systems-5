@@ -2,24 +2,26 @@ package com.company;
 
 import java.io.IOException;
 import java.util.Scanner;
-import java.util.concurrent.CountDownLatch;
 
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.Watcher.Event.KeeperState;
 import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.AsyncCallback.StatCallback;
-import org.apache.zookeeper.KeeperException.Code;
-import org.apache.zookeeper.data.Stat;
+
+import static java.lang.Thread.sleep;
+
 
 public class Executor implements Runnable, Watcher {
 
     private static ZooKeeper zooKeeper;
+    private final ChildrenExecutor childrenExecutor;
+    private String znode;
+    private Process currProcess;
+    private String[] exec;
 
     public static void main(String[] args) throws IOException, KeeperException {
         if (args.length < 4) {
-            System.err.println("USAGE: Executor hostPort znode filename program [args ...]");
+            System.err.println("USAGE: Executor hostPort znode program [args ...]");
             System.exit(2);
         }
         String hostPort = args[0];
@@ -28,7 +30,7 @@ public class Executor implements Runnable, Watcher {
         System.arraycopy(args, 2, exec, 0, exec.length);
         zooKeeper = new ZooKeeper(hostPort, 3000, null);
 
-        Thread watcher = new Thread(new Executor(znode, zooKeeper, exec, Runtime.getRuntime()));
+        Thread watcher = new Thread(new Executor(znode, exec));
         watcher.start();
 
         final Scanner scanner = new Scanner(System.in);
@@ -37,7 +39,11 @@ public class Executor implements Runnable, Watcher {
             final String input = scanner.next();
 
             if ("tree".equals(input)) {
-                this.tree(znode, 0);
+                try {
+                    tree(znode, 0);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
             }
             else if ("exit".equals(input)) {
                 watcher.interrupt();
@@ -46,37 +52,76 @@ public class Executor implements Runnable, Watcher {
         }
     }
 
-    public Executor(String znode, ZooKeeper zooKeeper, String exec[], Runtime context) throws KeeperException, IOException {
+    public Executor(String znode, String exec[]) throws KeeperException, IOException {
         this.znode = znode;
-        this.zooKeeper = zooKeeper;
+        this.exec = exec;
         zooKeeper.register(this);
-        dm = new DataMonitor(zk, znode, null, this);
+        this.childrenExecutor = new ChildrenExecutor(znode);
+        zooKeeper.exists(znode, true, null, this);
     }
 
-    private void tree(String znode, int indent) throws KeeperException, InterruptedException {
+    private static void tree(String znode, int indent) throws KeeperException, InterruptedException {
         for (int i =0; i<indent; i++){
-            System.out.println(" ");
+            System.out.print(" ");
         }
         System.out.println(znode);
 
-        for (String child : this.zooKeeper.getChildren(znode, false)) {
-            this.tree(znode + "/" + child, indent + 1);
+        try {
+            for (String child : zooKeeper.getChildren(znode, false)) {
+                tree(znode + "/" + child, indent + 1);
+            }
+        } catch (KeeperException ignored) {
         }
     }
 
     public void run() {
-        try {
-            synchronized (this) {
-                while (!dm.dead) {
-                    wait();
-                }
+        while (true) {
+            try {
+                sleep(60);
+            } catch (InterruptedException ignored) {
             }
-        } catch (InterruptedException e) {
         }
     }
 
     @Override
     public void process(WatchedEvent watchedEvent) {
+        this.serveEvent(watchedEvent);
+        zooKeeper.exists(znode, true, null, this);
+        zooKeeper.getChildren(znode, true, childrenExecutor, this);
+    }
 
+    public void serveEvent(WatchedEvent watchedEvent) {
+        final Event.EventType watchedEventType = watchedEvent.getType();
+
+        if (!this.znode.equals(watchedEvent.getPath())) {
+            return;
+        }
+
+        switch (watchedEventType) {
+            case NodeCreated:
+                if (this.currProcess != null) {
+                    return;
+                }
+                try {
+                    currProcess = Runtime.getRuntime().exec(this.exec);
+                }
+                catch (IOException e) {
+                    e.printStackTrace();
+                }
+                break;
+            case NodeDeleted:
+                if (this.currProcess == null) {
+                    return;
+                }
+                this.currProcess.destroy();
+                try {
+                    this.currProcess.waitFor();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                break;
+            default:
+                break;
+        }
     }
 }
